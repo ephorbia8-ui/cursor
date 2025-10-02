@@ -109,20 +109,35 @@ def hex_to_rl_color(hex_color: str):
 
 def ensure_arabic_font(root: tk.Tk) -> str:
   os.makedirs(FONTS_DIR, exist_ok=True)
-  font_path = os.path.join(FONTS_DIR, DEFAULT_AR_FONT_FILE)
-  if not os.path.exists(font_path):
+  # Try multiple Arabic-capable fonts without prompting
+  candidates = [
+    ("Amiri", "Amiri-Regular.ttf", "https://github.com/aliftype/amiri/releases/download/0.116/Amiri-Regular.ttf"),
+    ("NotoNaskhArabic", "NotoNaskhArabic-Regular.ttf", "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf"),
+    ("NotoSansArabic", "NotoSansArabic-Regular.ttf", "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansArabic/NotoSansArabic-Regular.ttf"),
+  ]
+  # Also try system DejaVuSans if present
+  system_dejavu = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+  if os.path.exists(system_dejavu):
     try:
-      import urllib.request
-      url = "https://github.com/aliftype/amiri/releases/download/0.116/Amiri-Regular.ttf"
-      urllib.request.urlretrieve(url, font_path)
+      pdfmetrics.registerFont(TTFont("DejaVuSans", system_dejavu))
+      return "DejaVuSans"
     except Exception:
-      # Do not prompt user; fallback to base fonts (Arabic shaping may degrade)
-      return "Helvetica"
-  try:
-    pdfmetrics.registerFont(TTFont(DEFAULT_AR_FONT_NAME, font_path))
-    return DEFAULT_AR_FONT_NAME
-  except Exception:
-    return "Helvetica"
+      pass
+  import urllib.request
+  for fname, ffile, url in candidates:
+    path = os.path.join(FONTS_DIR, ffile)
+    if not os.path.exists(path):
+      try:
+        urllib.request.urlretrieve(url, path)
+      except Exception:
+        continue
+    try:
+      pdfmetrics.registerFont(TTFont(fname, path))
+      return fname
+    except Exception:
+      continue
+  # Fallback (may not render Arabic properly)
+  return "Helvetica"
 
 def ar_text(txt: str) -> str:
   if not txt:
@@ -629,6 +644,15 @@ class SchedulerGUI:
     doc = SimpleDocTemplate(master_path, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
     story: List = []
     self._build_calendar_table(story, "الجدول الرئيسي", all_sessions, multi, font_name)
+    # Per-group totals summary under the master grid
+    totals_text = []
+    for g, items in per_group.items():
+      totals_text.append(f"G{g}: {sum(s.duration for s in items)}")
+    if totals_text:
+      story.append(Spacer(1, 8))
+      story.append(Paragraph(ar_text("إجمالي الساعات لكل مجموعة: ") + 
+        ar_text(" ") + ar_text("، ").join(ar_text(t) for t in totals_text),
+        ParagraphStyle(name='Totals', fontName=font_name, fontSize=12, leading=16, alignment=2)))
     doc.build(story)
 
     for g, items in per_group.items():
@@ -641,20 +665,20 @@ class SchedulerGUI:
       story_g.append(Paragraph(ar_text(f"إجمالي الساعات: {total_hours}"), ParagraphStyle(name='Body', fontName=font_name, fontSize=12, leading=16, alignment=2)))
       docg.build(story_g)
 
-    # All groups in one PDF (each group on its own page)
-    all_groups_path = os.path.join(outdir, "all_groups.pdf")
-    doc_all = SimpleDocTemplate(all_groups_path, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
-    story_all: List = []
-    first = True
+    # Combined all groups in the SAME page/grid: reuse all_sessions grid (already combined)
+    combined_path = os.path.join(outdir, "all_groups_combined.pdf")
+    doc_comb = SimpleDocTemplate(combined_path, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    story_comb: List = []
+    self._build_calendar_table(story_comb, "الجدول الموحد لكل المجموعات", all_sessions, multi, font_name)
+    totals_text2 = []
     for g, items in per_group.items():
-      if not first:
-        story_all.append(Spacer(1, 18))
-      first = False
-      self._build_calendar_table(story_all, f"جدول المجموعة {g}", items, multi, font_name)
-      total_hours = sum(s.duration for s in items)
-      story_all.append(Spacer(1, 8))
-      story_all.append(Paragraph(ar_text(f"إجمالي الساعات: {total_hours}"), ParagraphStyle(name='Body', fontName=font_name, fontSize=12, leading=16, alignment=2)))
-    doc_all.build(story_all)
+      totals_text2.append(f"G{g}: {sum(s.duration for s in items)}")
+    if totals_text2:
+      story_comb.append(Spacer(1, 8))
+      story_comb.append(Paragraph(ar_text("إجمالي الساعات لكل مجموعة: ") + 
+        ar_text(" ") + ar_text("، ").join(ar_text(t) for t in totals_text2),
+        ParagraphStyle(name='Totals', fontName=font_name, fontSize=12, leading=16, alignment=2)))
+    doc_comb.build(story_comb)
 
   def export_dialog(self):
     if not self.last_scheduled:
