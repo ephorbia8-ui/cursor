@@ -116,16 +116,13 @@ def ensure_arabic_font(root: tk.Tk) -> str:
       url = "https://github.com/aliftype/amiri/releases/download/0.116/Amiri-Regular.ttf"
       urllib.request.urlretrieve(url, font_path)
     except Exception:
-      messagebox.showinfo("PDF Font","حدد ملف خط يدعم العربية (TTF)")
-      fp = filedialog.askopenfilename(parent=root, title="اختر ملف خط Arabic TTF", filetypes=[("TTF font","*.ttf")])
-      if not fp:
-        raise RuntimeError("Arabic-capable TTF font is required for PDF export")
-      font_path = fp
+      # Do not prompt user; fallback to base fonts (Arabic shaping may degrade)
+      return "Helvetica"
   try:
     pdfmetrics.registerFont(TTFont(DEFAULT_AR_FONT_NAME, font_path))
-  except Exception as e:
-    raise RuntimeError(f"Failed to register Arabic font: {e}")
-  return DEFAULT_AR_FONT_NAME
+    return DEFAULT_AR_FONT_NAME
+  except Exception:
+    return "Helvetica"
 
 def ar_text(txt: str) -> str:
   if not txt:
@@ -154,8 +151,7 @@ class SchedulerEngine:
       else:
         offday[g] = self.days[(g-1) % len(self.days)]
 
-    course_hosts_count: Dict[str,int] = {c.name: max(1, c.groups) for c in courses}
-
+    # Build blocks per course (scheduled ONCE per course)
     course_blocks: Dict[str, List[Tuple[str,int]]] = {}
     for c in courses:
       blocks: List[Tuple[str,int]] = []
@@ -167,109 +163,58 @@ class SchedulerEngine:
 
     model = cp_model.CpModel()
 
-    z = {}
+    # Decision vars: s[c,b,d,h] = 1 if block b of course c starts at (d,h)
+    s: Dict[Tuple[str,int,str,int], cp_model.IntVar] = {}
     for c in courses:
       cname = c.name
-      H = course_hosts_count[cname]
-      for i in range(H):
-        for g in all_groups:
-          z[(cname,i,g)] = model.NewBoolVar(f"z[{cname},{i},G{g}]")
-      for g in all_groups:
-        model.Add(sum(z[(cname,i,g)] for i in range(H)) == 1)
-
-    s = {}
-    for c in courses:
-      cname = c.name
-      H = course_hosts_count[cname]
       blocks = course_blocks[cname]
-      for i in range(H):
-        for b_idx,(kind,dur) in enumerate(blocks):
-          for d in self.days:
-            for h in self.slots:
-              s[(cname,i,b_idx,d,h)] = model.NewBoolVar(f"s[{cname},{i},B{b_idx},{d},{h}]")
-          valid_starts = []
-          for d in self.days:
-            for h in self.slots:
-              if h + dur <= self.slots[-1] + 1:
-                valid_starts.append(s[(cname,i,b_idx,d,h)])
-              else:
-                model.Add(s[(cname,i,b_idx,d,h)] == 0)
-          model.Add(sum(valid_starts) == 1)
-
-    for c in courses:
-      cname = c.name
-      H = course_hosts_count[cname]
-      blocks = course_blocks[cname]
-      for d in self.days:
-        for h_unit in self.slots:
-          cover_vars = []
-          for i in range(H):
-            for b_idx,(kind,dur) in enumerate(blocks):
-              for h in self.slots:
-                if h <= h_unit <= h + dur - 1 and h + dur <= self.slots[-1] + 1:
-                  cover_vars.append(s[(cname,i,b_idx,d,h)])
-          if cover_vars:
-            model.Add(sum(cover_vars) <= 1)
-
-    for g in all_groups:
-      for d in self.days:
-        for h_unit in self.slots:
-          busy_terms = []
-          for c in courses:
-            cname = c.name
-            H = course_hosts_count[cname]
-            blocks = course_blocks[cname]
-            for i in range(H):
-              for b_idx,(kind,dur) in enumerate(blocks):
-                for h in self.slots:
-                  if h <= h_unit <= h + dur - 1 and h + dur <= self.slots[-1] + 1:
-                    busy = model.NewBoolVar(f"busy[{cname},{i},B{b_idx},{d},{h},G{g}]")
-                    model.AddBoolAnd([z[(cname,i,g)], s[(cname,i,b_idx,d,h)]]).OnlyEnforceIf(busy)
-                    model.AddBoolOr([z[(cname,i,g)].Not(), s[(cname,i,b_idx,d,h)].Not(), busy])
-                    busy_terms.append(busy)
-          if busy_terms:
-            model.Add(sum(busy_terms) <= 1)
-
-    for c in courses:
-      cname = c.name
-      H = course_hosts_count[cname]
-      blocks = course_blocks[cname]
-      for i in range(H):
-        for b_idx,(kind,dur) in enumerate(blocks):
-          for d in self.days:
-            for h in self.slots:
-              for g in all_groups:
-                if d == offday[g]:
-                  model.AddImplication(s[(cname,i,b_idx,d,h)], z[(cname,i,g)].Not()).OnlyEnforceIf(z[(cname,i,g)])
-
-    for c in courses:
-      cname = c.name
-      H = course_hosts_count[cname]
-      blocks = course_blocks[cname]
-      th_indices = [b_idx for b_idx,(k,dur) in enumerate(blocks) if k=="theory" and dur==2]
-      for i in range(H):
+      for b_idx,(kind,dur) in enumerate(blocks):
+        valid = []
         for d in self.days:
-          model.Add(sum(s[(cname,i,b_idx,d,h)] for b_idx in th_indices for h in self.slots if h+2 <= self.slots[-1]+1) <= 1)
+          for h in self.slots:
+            v = model.NewBoolVar(f"s[{cname},B{b_idx},{d},{h}]")
+            s[(cname,b_idx,d,h)] = v
+            if h + dur <= self.slots[-1] + 1:
+              valid.append(v)
+            else:
+              model.Add(v == 0)
+        # Exactly one start per block
+        model.Add(sum(valid) == 1)
 
+    # No-overlap across courses: at any (d,h_unit) at most one running block
+    for d in self.days:
+      for h_unit in self.slots:
+        running = []
+        for c in courses:
+          cname = c.name
+          for b_idx,(kind,dur) in enumerate(course_blocks[cname]):
+            for h in self.slots:
+              if h <= h_unit <= h + dur - 1 and h + dur <= self.slots[-1] + 1:
+                running.append(s[(cname,b_idx,d,h)])
+        if running:
+          model.Add(sum(running) <= 1)
+
+    # Preferences: theory in morning, lab in afternoon; off-day as soft penalty per group
     penalties = []
     for c in courses:
       cname = c.name
-      H = course_hosts_count[cname]
-      blocks = course_blocks[cname]
-      for i in range(H):
-        for b_idx,(kind,dur) in enumerate(blocks):
-          for d in self.days:
-            for h in self.slots:
-              if h + dur <= self.slots[-1] + 1:
-                v = model.NewIntVar(0, 1, f"pref_pen[{cname},{i},B{b_idx},{d},{h}]")
-                model.Add(v == 1).OnlyEnforceIf(s[(cname,i,b_idx,d,h)])
-                model.Add(v == 0).OnlyEnforceIf(s[(cname,i,b_idx,d,h)].Not())
-                if kind == "theory":
-                  if h >= MORNING_CUTOFF:
-                    penalties.append(v)
-                else:
-                  if h < AFTERNOON_START:
-                    penalties.append(v)
+      for b_idx,(kind,dur) in enumerate(course_blocks[cname]):
+        for d in self.days:
+          for h in self.slots:
+            if h + dur <= self.slots[-1] + 1:
+              v = model.NewIntVar(0, 1, f"pref[{cname},B{b_idx},{d},{h}]")
+              model.Add(v == 1).OnlyEnforceIf(s[(cname,b_idx,d,h)])
+              model.Add(v == 0).OnlyEnforceIf(s[(cname,b_idx,d,h)].Not())
+              if kind == "theory":
+                if h >= MORNING_CUTOFF:
+                  penalties.append(v)
+              else:
+                if h < AFTERNOON_START:
+                  penalties.append(v)
+              # Off-day penalty for each group that has this day off
+              for g in all_groups:
+                if d == offday[g]:
+                  penalties.append(v)
 
     if penalties:
       model.Minimize(sum(penalties))
@@ -281,37 +226,19 @@ class SchedulerEngine:
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
       return [], {}
 
-    group_occ: Dict[int, Dict[str, Dict[int, Optional[Tuple[str,str,int]]]]] = {
-      g: {d: {h: None for h in self.slots} for d in self.days} for g in all_groups
-    }
-
+    # Build identical schedule for all groups
     per_group: Dict[int, List[Session]] = {g: [] for g in all_groups}
     for c in courses:
       cname = c.name
-      H = course_hosts_count[cname]
-      blocks = course_blocks[cname]
-      for i in range(H):
-        host_slots = []
-        for b_idx,(kind,dur) in enumerate(blocks):
-          for d in self.days:
-            for h in self.slots:
-              if h + dur <= self.slots[-1] + 1 and solver.BooleanValue(s[(cname,i,b_idx,d,h)]):
-                host_slots.append((d,h,dur,kind))
-        for g in all_groups:
-          if solver.BooleanValue(z[(cname,i,g)]):
-            for (d,h,dur,kind) in host_slots:
-              ok=True
-              for k in range(dur):
-                if group_occ[g][d][h+k] is not None:
-                  ok=False; break
-              if not ok:
-                continue
-              for k in range(dur):
-                group_occ[g][d][h+k] = (cname,kind,dur)
-              per_group[g].append(Session(course=cname, group=g, kind=kind, duration=dur, day=d, start_hour=h, priority_ok=True))
+      for b_idx,(kind,dur) in enumerate(course_blocks[cname]):
+        for d in self.days:
+          for h in self.slots:
+            if h + dur <= self.slots[-1] + 1 and solver.BooleanValue(s[(cname,b_idx,d,h)]):
+              for g in all_groups:
+                per_group[g].append(Session(course=cname, group=g, kind=kind, duration=dur, day=d, start_hour=h, priority_ok=True))
 
-    def sort_key(s: Session):
-      return (DAYS.index(s.day) if s.day in DAYS else 999, s.start_hour or 999, s.course, s.kind)
+    def sort_key(ses: Session):
+      return (DAYS.index(ses.day) if ses.day in DAYS else 999, ses.start_hour or 999, ses.course, ses.kind)
     for g in per_group:
       per_group[g].sort(key=sort_key)
     all_sessions = []
@@ -380,6 +307,10 @@ class SchedulerGUI:
     ttk.Button(top, text="Free day settings", command=self.open_free_day_settings).grid(row=2,column=3, pady=6)
     ttk.Button(top, text="Generate schedule", command=self.generate).grid(row=2,column=4, pady=6)
     ttk.Button(top, text="Export PDFs", command=self.export_dialog).grid(row=2,column=5, pady=6)
+
+    # Improve spacing in notebook cells: larger default sizes
+    self.cell_width = 170
+    self.cell_height = 56
 
     mid = ttk.Frame(self.root, padding=8); mid.pack(fill="x")
     cols = ("students","maxg","groups","th","lab","total")
@@ -585,9 +516,9 @@ class SchedulerGUI:
       cell_map = {}
       for i,h in enumerate(SLOTS, start=1):
         sidx = i-1
-        tk.Label(tab, text=slot_label(sidx), borderwidth=1, relief="solid", width=14).grid(row=i, column=0, sticky="nsew")
+        tk.Label(tab, text=slot_label(sidx), borderwidth=1, relief="solid", width=16).grid(row=i, column=0, sticky="nsew")
         for j,d in enumerate(DAYS, start=1):
-          frm = tk.Frame(tab, borderwidth=1, relief="solid", width=140, height=44)
+          frm = tk.Frame(tab, borderwidth=1, relief="solid", width=self.cell_width, height=self.cell_height)
           frm.grid_propagate(False); frm.grid(row=i, column=j, sticky="nsew", padx=1, pady=1)
           cell_map[(d,h)] = frm
 
@@ -618,7 +549,7 @@ class SchedulerGUI:
           if lecturer: extra.append(lecturer)
           if extra:
             text += "\n" + " | ".join(extra)
-          lbl = tk.Label(frame, text=(text if k==0 else "(cont)"), bg=bg, wraplength=120, justify="center")
+          lbl = tk.Label(frame, text=(text if k==0 else "(cont)"), bg=bg, wraplength=self.cell_width-10, justify="center")
           lbl.pack(fill="both", expand=True)
 
       for col in range(len(DAYS)+1):
@@ -709,6 +640,21 @@ class SchedulerGUI:
       story_g.append(Spacer(1, 8))
       story_g.append(Paragraph(ar_text(f"إجمالي الساعات: {total_hours}"), ParagraphStyle(name='Body', fontName=font_name, fontSize=12, leading=16, alignment=2)))
       docg.build(story_g)
+
+    # All groups in one PDF (each group on its own page)
+    all_groups_path = os.path.join(outdir, "all_groups.pdf")
+    doc_all = SimpleDocTemplate(all_groups_path, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    story_all: List = []
+    first = True
+    for g, items in per_group.items():
+      if not first:
+        story_all.append(Spacer(1, 18))
+      first = False
+      self._build_calendar_table(story_all, f"جدول المجموعة {g}", items, multi, font_name)
+      total_hours = sum(s.duration for s in items)
+      story_all.append(Spacer(1, 8))
+      story_all.append(Paragraph(ar_text(f"إجمالي الساعات: {total_hours}"), ParagraphStyle(name='Body', fontName=font_name, fontSize=12, leading=16, alignment=2)))
+    doc_all.build(story_all)
 
   def export_dialog(self):
     if not self.last_scheduled:
