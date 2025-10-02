@@ -156,9 +156,11 @@ class SchedulerEngine:
     self.afternoon_start = AFTERNOON_START
 
   def schedule(self, courses: List[CourseInfo], free_day_overrides: Optional[Dict[int, str]] = None):
+    # Groups universe
     max_groups = max((c.groups for c in courses), default=1)
     all_groups = list(range(1, max_groups + 1))
 
+    # Off-day per group
     offday: Dict[int, str] = {}
     for g in all_groups:
       if free_day_overrides and g in free_day_overrides and free_day_overrides[g] in self.days:
@@ -166,7 +168,10 @@ class SchedulerEngine:
       else:
         offday[g] = self.days[(g-1) % len(self.days)]
 
-    # Build blocks per course (scheduled ONCE per course)
+    # For each course, compute host count (teaching load groups)
+    course_hosts_count: Dict[str,int] = {c.name: max(1, c.groups) for c in courses}
+
+    # Build blocks per course
     course_blocks: Dict[str, List[Tuple[str,int]]] = {}
     for c in courses:
       blocks: List[Tuple[str,int]] = []
@@ -176,84 +181,174 @@ class SchedulerEngine:
         blocks.append(("theory", b))
       course_blocks[c.name] = blocks
 
+    # CP-SAT model
     model = cp_model.CpModel()
 
-    # Decision vars: s[c,b,d,h] = 1 if block b of course c starts at (d,h)
-    s: Dict[Tuple[str,int,str,int], cp_model.IntVar] = {}
+    # Decision vars:
+    # z[c,i,g] ∈ {0,1}: group g belongs to host cluster i of course c (exactly one host per course per group)
+    z = {}
     for c in courses:
       cname = c.name
+      H = course_hosts_count[cname]
+      for i in range(H):
+        for g in all_groups:
+          z[(cname,i,g)] = model.NewBoolVar(f"z[{cname},{i},G{g}]")
+      # each group assigned to exactly one host for this course
+      for g in all_groups:
+        model.Add(sum(z[(cname,i,g)] for i in range(H)) == 1)
+
+    # s[c,i,b,d,h] ∈ {0,1}: block b of course c for host i starts at day d, hour h
+    # Each block scheduled exactly once per host (so hosts repeat full coverage)
+    s = {}
+    for c in courses:
+      cname = c.name
+      H = course_hosts_count[cname]
       blocks = course_blocks[cname]
-      for b_idx,(kind,dur) in enumerate(blocks):
-        valid = []
-        for d in self.days:
-          for h in self.slots:
-            v = model.NewBoolVar(f"s[{cname},B{b_idx},{d},{h}]")
-            s[(cname,b_idx,d,h)] = v
-            if h + dur <= self.slots[-1] + 1:
-              valid.append(v)
-            else:
-              model.Add(v == 0)
-        # Exactly one start per block
-        model.Add(sum(valid) == 1)
-
-    # No-overlap across courses: at any (d,h_unit) at most one running block
-    for d in self.days:
-      for h_unit in self.slots:
-        running = []
-        for c in courses:
-          cname = c.name
-          for b_idx,(kind,dur) in enumerate(course_blocks[cname]):
+      for i in range(H):
+        for b_idx,(kind,dur) in enumerate(blocks):
+          for d in self.days:
             for h in self.slots:
-              if h <= h_unit <= h + dur - 1 and h + dur <= self.slots[-1] + 1:
-                running.append(s[(cname,b_idx,d,h)])
-        if running:
-          model.Add(sum(running) <= 1)
+              s[(cname,i,b_idx,d,h)] = model.NewBoolVar(f"s[{cname},{i},B{b_idx},{d},{h}]")
+          # valid start windows
+          valid_starts = []
+          for d in self.days:
+            for h in self.slots:
+              if h + dur <= self.slots[-1] + 1:
+                valid_starts.append(s[(cname,i,b_idx,d,h)])
+              else:
+                model.Add(s[(cname,i,b_idx,d,h)] == 0)
+          model.Add(sum(valid_starts) == 1)
 
-    # Preferences: theory in morning, lab in afternoon; off-day as soft penalty per group
+    # One-lecturer per course: at any (d,h) slot-unit, at most one block of that course running across all hosts
+    for c in courses:
+      cname = c.name
+      H = course_hosts_count[cname]
+      blocks = course_blocks[cname]
+      for d in self.days:
+        for h_unit in self.slots:
+          cover_vars = []
+          for i in range(H):
+            for b_idx,(kind,dur) in enumerate(blocks):
+              for h in self.slots:
+                if h <= h_unit <= h + dur - 1 and h + dur <= self.slots[-1] + 1:
+                  cover_vars.append(s[(cname,i,b_idx,d,h)])
+          if cover_vars:
+            model.Add(sum(cover_vars) <= 1)
+
+    # Group occupancy: each group can attend at most one block at a time across all courses/hosts it is assigned to
+    for g in all_groups:
+      for d in self.days:
+        for h_unit in self.slots:
+          busy_terms = []
+          for c in courses:
+            cname = c.name
+            H = course_hosts_count[cname]
+            blocks = course_blocks[cname]
+            for i in range(H):
+              for b_idx,(kind,dur) in enumerate(blocks):
+                for h in self.slots:
+                  if h <= h_unit <= h + dur - 1 and h + dur <= self.slots[-1] + 1:
+                    busy = model.NewBoolVar(f"busy[{cname},{i},B{b_idx},{d},{h},G{g}]")
+                    model.AddBoolAnd([z[(cname,i,g)], s[(cname,i,b_idx,d,h)]]).OnlyEnforceIf(busy)
+                    model.AddBoolOr([z[(cname,i,g)].Not(), s[(cname,i,b_idx,d,h)].Not(), busy])
+                    busy_terms.append(busy)
+          if busy_terms:
+            model.Add(sum(busy_terms) <= 1)
+
+    # Off-day: if group g has offday d, it cannot be scheduled on that day
+    for c in courses:
+      cname = c.name
+      H = course_hosts_count[cname]
+      blocks = course_blocks[cname]
+      for i in range(H):
+        for b_idx,(kind,dur) in enumerate(blocks):
+          for d in self.days:
+            for h in self.slots:
+              for g in all_groups:
+                if d == offday[g]:
+                  model.AddImplication(s[(cname,i,b_idx,d,h)], z[(cname,i,g)].Not()).OnlyEnforceIf(z[(cname,i,g)])
+
+    # Theory split across different days for 2h chunks per host
+    for c in courses:
+      cname = c.name
+      H = course_hosts_count[cname]
+      blocks = course_blocks[cname]
+      th_indices = [b_idx for b_idx,(k,dur) in enumerate(blocks) if k=="theory" and dur==2]
+      for i in range(H):
+        for d in self.days:
+          model.Add(sum(s[(cname,i,b_idx,d,h)] for b_idx in th_indices for h in self.slots if h+2 <= self.slots[-1]+1) <= 1)
+
+    # Soft preferences objective: morning theory, afternoon lab; minimize violations
     penalties = []
     for c in courses:
       cname = c.name
-      for b_idx,(kind,dur) in enumerate(course_blocks[cname]):
-        for d in self.days:
-          for h in self.slots:
-            if h + dur <= self.slots[-1] + 1:
-              v = model.NewIntVar(0, 1, f"pref[{cname},B{b_idx},{d},{h}]")
-              model.Add(v == 1).OnlyEnforceIf(s[(cname,b_idx,d,h)])
-              model.Add(v == 0).OnlyEnforceIf(s[(cname,b_idx,d,h)].Not())
-              if kind == "theory":
-                if h >= MORNING_CUTOFF:
-                  penalties.append(v)
-              else:
-                if h < AFTERNOON_START:
-                  penalties.append(v)
-              # Off-day penalty for each group that has this day off
-              for g in all_groups:
-                if d == offday[g]:
-                  penalties.append(v)
+      H = course_hosts_count[cname]
+      blocks = course_blocks[cname]
+      for i in range(H):
+        for b_idx,(kind,dur) in enumerate(blocks):
+          for d in self.days:
+            for h in self.slots:
+              if h + dur <= self.slots[-1] + 1:
+                v = model.NewIntVar(0, 1, f"pref_pen[{cname},{i},B{b_idx},{d},{h}]")
+                model.Add(v == 1).OnlyEnforceIf(s[(cname,i,b_idx,d,h)])
+                model.Add(v == 0).OnlyEnforceIf(s[(cname,i,b_idx,d,h)].Not())
+                if kind == "theory":
+                  if h >= MORNING_CUTOFF:
+                    penalties.append(v)
+                else:
+                  if h < AFTERNOON_START:
+                    penalties.append(v)
 
     if penalties:
       model.Minimize(sum(penalties))
 
+    # Solve
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 20.0
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+      # fallback: no solution found
       return [], {}
 
-    # Build identical schedule for all groups
+    # Build schedule from model
+    # Occupancy grid for groups
+    group_occ: Dict[int, Dict[str, Dict[int, Optional[Tuple[str,str,int]]]]] = {
+      g: {d: {h: None for h in self.slots} for d in self.days} for g in all_groups
+    }
+
     per_group: Dict[int, List[Session]] = {g: [] for g in all_groups}
     for c in courses:
       cname = c.name
-      for b_idx,(kind,dur) in enumerate(course_blocks[cname]):
-        for d in self.days:
-          for h in self.slots:
-            if h + dur <= self.slots[-1] + 1 and solver.BooleanValue(s[(cname,b_idx,d,h)]):
-              for g in all_groups:
-                per_group[g].append(Session(course=cname, group=g, kind=kind, duration=dur, day=d, start_hour=h, priority_ok=True))
+      H = course_hosts_count[cname]
+      blocks = course_blocks[cname]
+      for i in range(H):
+        # collect scheduled starts
+        host_slots = []
+        for b_idx,(kind,dur) in enumerate(blocks):
+          for d in self.days:
+            for h in self.slots:
+              if h + dur <= self.slots[-1] + 1 and solver.BooleanValue(s[(cname,i,b_idx,d,h)]):
+                host_slots.append((d,h,dur,kind))
+        # attach to each group assigned to this host
+        for g in all_groups:
+          if solver.BooleanValue(z[(cname,i,g)]):
+            for (d,h,dur,kind) in host_slots:
+              # place for group g
+              ok=True
+              for k in range(dur):
+                if group_occ[g][d][h+k] is not None:
+                  ok=False; break
+              if not ok:
+                # shouldn't happen due to constraints
+                continue
+              for k in range(dur):
+                group_occ[g][d][h+k] = (cname,kind,dur)
+              per_group[g].append(Session(course=cname, group=g, kind=kind, duration=dur, day=d, start_hour=h, priority_ok=True))
 
-    def sort_key(ses: Session):
-      return (DAYS.index(ses.day) if ses.day in DAYS else 999, ses.start_hour or 999, ses.course, ses.kind)
+    # Sort outputs
+    def sort_key(s: Session):
+      return (DAYS.index(s.day) if s.day in DAYS else 999, s.start_hour or 999, s.course, s.kind)
     for g in per_group:
       per_group[g].sort(key=sort_key)
     all_sessions = []
@@ -576,16 +671,18 @@ class SchedulerGUI:
     story.append(Paragraph(ar_text(title), ParagraphStyle(name='Title', fontName=font_name, fontSize=16, leading=20, alignment=1)))
     story.append(Spacer(1, 6))
 
+    # Build a grid identical to the UI: rows=time slots, columns=days with left time column
     n_cols = 1 + len(DAYS)
     n_rows = 1 + len(SLOTS)
     data = [["" for _ in range(n_cols)] for __ in range(n_rows)]
 
-    data[0][0] = ar_text("الوقت/اليوم")
+    data[0][0] = ar_text("Time/Day")
     for j,d in enumerate(DAYS, start=1):
       data[0][j] = d
     for i in range(1, n_rows):
       data[i][0] = slot_label(i-1)
 
+    # fill cells with merged blocks and UI-like labels, include hall/lecturer if available
     style = TableStyle([
       ('FONT', (0,0), (-1,-1), font_name),
       ('ALIGN', (0,0), (-1,0), 'CENTER'),
@@ -596,20 +693,27 @@ class SchedulerGUI:
     ])
 
     spans: List[Tuple[Tuple[int,int], Tuple[int,int]]] = []
+    seen_keys = set()
     for s in items:
       if s.day is None or s.start_hour is None:
         continue
+      key = (s.course, s.day, s.start_hour, s.duration)
+      if key in seen_keys:
+        continue
+      seen_keys.add(key)
       col = 1 + DAYS.index(s.day)
       row = 1 + slot_idx_from_hour(s.start_hour)
-      text = f"{s.course}\n{','.join('G'+str(g) for g in multi.get((s.course, s.day, s.start_hour, s.duration), [s.group]))}\n{s.kind}"
+      groups = multi.get(key, [s.group])
+      att_txt = ",".join(f"G{g}" for g in groups)
+      text = f"{s.course}\n{att_txt}\n{s.kind}"
       info = self.courses.get(s.course)
-      text_extra = []
-      if info and info.hall:
-        text_extra.append(info.hall)
-      if info and info.lecturer:
-        text_extra.append(info.lecturer)
-      if text_extra:
-        text += "\n" + " | ".join(text_extra)
+      extra = []
+      if info and getattr(info, 'hall', None):
+        extra.append(info.hall)
+      if info and getattr(info, 'lecturer', None):
+        extra.append(info.lecturer)
+      if extra:
+        text += "\n" + " | ".join(extra)
       data[row][col] = ar_text(text)
       if s.duration > 1:
         spans.append(((col, row), (col, row + s.duration - 1)))
@@ -621,12 +725,13 @@ class SchedulerGUI:
     for (c0,r0),(c1,r1) in spans:
       style.add('SPAN', (c0,r0), (c1,r1))
 
-    total_width = 780
-    time_w = 110
+    # widths similar to UI sizing
+    total_width = 900
+    time_w = 120
     day_w = (total_width - time_w) / len(DAYS)
     col_widths = [time_w] + [day_w]*len(DAYS)
 
-    tbl = Table(data, colWidths=col_widths)
+    tbl = Table(data, colWidths=col_widths, rowHeights=[22] + [48]*len(SLOTS))
     tbl.setStyle(style)
     story.append(tbl)
 
