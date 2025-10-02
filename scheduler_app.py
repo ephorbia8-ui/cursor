@@ -19,6 +19,7 @@ import arabic_reshaper
 from bidi.algorithm import get_display
 
 DAYS = ["Sun","Mon","Tue","Wed","Thu"]
+AR_DAYS = ["الأحد","الإثنين","الثلاثاء","الأربعاء","الخميس"]
 SLOT_START = 8
 SLOT_COUNT = 8
 SLOTS = list(range(SLOT_START, SLOT_START + SLOT_COUNT))  # 08..15 start-hours
@@ -677,7 +678,7 @@ class SchedulerGUI:
 
     data[0][0] = ar_text("الوقت/اليوم")
     for j,d in enumerate(DAYS, start=1):
-      data[0][j] = d
+      data[0][j] = AR_DAYS[j-1]
     for i in range(1, n_rows):
       data[i][0] = slot_label(i-1)
 
