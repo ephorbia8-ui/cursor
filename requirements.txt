@@ -1,0 +1,4 @@
+ortools>=9.10.4067
+reportlab>=4.2.2
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
