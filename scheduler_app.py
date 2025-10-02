@@ -730,9 +730,10 @@ class SchedulerGUI:
     for (c0,r0),(c1,r1) in spans:
       style.add('SPAN', (c0,r0), (c1,r1))
 
-    # widths similar to UI sizing and page width (A4 landscape minus margins ~ 806pt)
-    total_width = 806
-    time_w = 130
+    # Fit table to full page width (A4 landscape minus margins 18+18)
+    page_w, page_h = landscape(A4)
+    total_width = page_w - 36
+    time_w = max(110, total_width * 0.18)
     day_w = (total_width - time_w) / len(DAYS)
     col_widths = [time_w] + [day_w]*len(DAYS)
 
@@ -746,7 +747,8 @@ class SchedulerGUI:
     for c in range(2, n_cols):
       style.add('LINEBEFORE', (c,0), (c,n_rows-1), 0.4, colors.HexColor('#d9dbe3'))
 
-    tbl = Table(data, colWidths=col_widths, rowHeights=[28] + [56]*len(SLOTS))
+    # Let ReportLab calculate row heights to avoid clipping and ensure fit
+    tbl = Table(data, colWidths=col_widths)
     tbl.setStyle(style)
     story.append(tbl)
 
