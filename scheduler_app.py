@@ -668,15 +668,15 @@ class SchedulerGUI:
         tab.grid_rowconfigure(row, weight=1)
 
   def _build_calendar_table(self, story: List, title: str, items: List[Session], multi: Dict[Tuple[str,str,int,int], List[int]], font_name: str):
-    story.append(Paragraph(ar_text(title), ParagraphStyle(name='Title', fontName=font_name, fontSize=16, leading=20, alignment=1)))
-    story.append(Spacer(1, 6))
+    story.append(Paragraph(ar_text(title), ParagraphStyle(name='Title', fontName=font_name, fontSize=18, leading=22, alignment=1)))
+    story.append(Spacer(1, 8))
 
     # Build a grid identical to the UI: rows=time slots, columns=days with left time column
     n_cols = 1 + len(DAYS)
     n_rows = 1 + len(SLOTS)
     data = [["" for _ in range(n_cols)] for __ in range(n_rows)]
 
-    data[0][0] = ar_text("Time/Day")
+    data[0][0] = ar_text("الوقت/اليوم")
     for j,d in enumerate(DAYS, start=1):
       data[0][j] = d
     for i in range(1, n_rows):
@@ -685,11 +685,17 @@ class SchedulerGUI:
     # fill cells with merged blocks and UI-like labels, include hall/lecturer if available
     style = TableStyle([
       ('FONT', (0,0), (-1,-1), font_name),
+      ('FONTSIZE', (0,0), (-1,-1), 11),
       ('ALIGN', (0,0), (-1,0), 'CENTER'),
-      ('ALIGN', (0,1), (0,-1), 'CENTER'),
+      ('ALIGN', (0,1), (-1,-1), 'CENTER'),
       ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-      ('GRID', (0,0), (-1,-1), 0.5, colors.black),
-      ('BACKGROUND', (0,0), (-1,0), colors.whitesmoke),
+      ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2d3e50')),
+      ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+      ('TOPPADDING', (0,0), (-1,-1), 6),
+      ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+      ('LEFTPADDING', (0,0), (-1,-1), 6),
+      ('RIGHTPADDING', (0,0), (-1,-1), 6),
+      ('GRID', (0,0), (-1,-1), 0.4, colors.HexColor('#c9ccd6')),
     ])
 
     spans: List[Tuple[Tuple[int,int], Tuple[int,int]]] = []
@@ -725,13 +731,23 @@ class SchedulerGUI:
     for (c0,r0),(c1,r1) in spans:
       style.add('SPAN', (c0,r0), (c1,r1))
 
-    # widths similar to UI sizing
-    total_width = 900
-    time_w = 120
+    # widths similar to UI sizing and page width (A4 landscape minus margins ~ 806pt)
+    total_width = 806
+    time_w = 130
     day_w = (total_width - time_w) / len(DAYS)
     col_widths = [time_w] + [day_w]*len(DAYS)
 
-    tbl = Table(data, colWidths=col_widths, rowHeights=[22] + [48]*len(SLOTS))
+    # Zebra rows and time-column subtle background
+    for r in range(1, n_rows):
+      if r % 2 == 0:
+        style.add('BACKGROUND', (0,r), (-1,r), colors.HexColor('#f7f9fc'))
+      style.add('BACKGROUND', (0,r), (0,r), colors.HexColor('#f1f3f7'))
+
+    # Vertical separators between day columns
+    for c in range(2, n_cols):
+      style.add('LINEBEFORE', (c,0), (c,n_rows-1), 0.4, colors.HexColor('#d9dbe3'))
+
+    tbl = Table(data, colWidths=col_widths, rowHeights=[28] + [56]*len(SLOTS))
     tbl.setStyle(style)
     story.append(tbl)
 
