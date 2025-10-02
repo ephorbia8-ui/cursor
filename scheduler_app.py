@@ -299,8 +299,7 @@ class SchedulerEngine:
                   if h < AFTERNOON_START:
                     penalties.append(v)
 
-    if penalties:
-      model.Minimize(sum(penalties))
+    model.Minimize(sum(penalties))
 
     # Solve
     solver = cp_model.CpSolver()
