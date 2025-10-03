@@ -676,9 +676,9 @@ class SchedulerGUI:
     n_rows = 1 + len(SLOTS)
     data = [["" for _ in range(n_cols)] for __ in range(n_rows)]
 
-    data[0][0] = ar_text("الوقت/اليوم")
+    data[0][0] = ar_text("Time/Day")
     for j,d in enumerate(DAYS, start=1):
-      data[0][j] = AR_DAYS[j-1]
+      data[0][j] = d
     for i in range(1, n_rows):
       data[i][0] = slot_label(i-1)
 
