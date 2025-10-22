@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, colorchooser, simpledialog
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
+import copy
 import hashlib, json, os
 
 # OR-Tools CP-SAT
@@ -19,6 +20,7 @@ import arabic_reshaper
 from bidi.algorithm import get_display
 
 DAYS = ["Sun","Mon","Tue","Wed","Thu"]
+AR_DAYS = ["الأحد","الإثنين","الثلاثاء","الأربعاء","الخميس"]
 SLOT_START = 8
 SLOT_COUNT = 8
 SLOTS = list(range(SLOT_START, SLOT_START + SLOT_COUNT))  # 08..15 start-hours
@@ -51,6 +53,9 @@ class Session:
   day: Optional[str] = None
   start_hour: Optional[int] = None  # one of SLOTS
   priority_ok: bool = True
+  lecturer: Optional[str] = None
+  hall: Optional[str] = None
+  session_id: str = ""
 
 def deterministic_color(name: str) -> str:
   h = hashlib.sha1(name.encode('utf-8')).hexdigest()
@@ -341,7 +346,26 @@ class SchedulerGUI:
     self.hall_label_var = tk.StringVar(value="—")
     self.lect_label_var = tk.StringVar(value="—")
 
+    # clipboard for copy/paste of sessions
+    self._clipboard_session: Optional[Session] = None
+
     self.build_ui()
+
+  def _rebuild_indexes_from_last_scheduled(self):
+    per_group: Dict[int, List[Session]] = {}
+    multi: Dict[Tuple[str,str,int,int], List[int]] = {}
+    for s in self.last_scheduled:
+      per_group.setdefault(s.group, []).append(s)
+      if s.day is not None and s.start_hour is not None:
+        key = (s.course, s.day, s.start_hour, s.duration)
+        multi.setdefault(key, []).append(s.group)
+    # sort per group
+    def sort_key(s: Session):
+      return (DAYS.index(s.day) if s.day in DAYS else 999, s.start_hour or 999, s.course, s.kind)
+    for g in per_group:
+      per_group[g].sort(key=sort_key)
+    self.last_per_group = per_group
+    self.multislot_groups = {k: sorted(set(v)) for k, v in multi.items()}
 
   def build_ui(self):
     top = ttk.Frame(self.root, padding=8)
@@ -554,16 +578,20 @@ class SchedulerGUI:
     if not all_sessions:
       self.status.config(text="Solver found no feasible solution. Try adjusting inputs.")
       return
+    # augment sessions with lecturer/hall from course and ids
+    for idx, s in enumerate(all_sessions):
+      info = self.courses.get(s.course)
+      if info:
+        if s.lecturer is None:
+          s.lecturer = info.lecturer
+        if s.hall is None:
+          s.hall = info.hall
+      if not s.session_id:
+        s.session_id = f"auto_{idx}_{s.course}_{s.group}_{s.day}_{s.start_hour}"
     self.last_scheduled = all_sessions
-    self.last_per_group = per_group
-    multi: Dict[Tuple[str,str,int,int], List[int]] = {}
-    for s in all_sessions:
-      key = (s.course, s.day, s.start_hour, s.duration)
-      multi.setdefault(key, []).append(s.group)
-    for k in multi:
-      multi[k] = sorted(set(multi[k]))
-    self.multislot_groups = multi
-    self.render_calendar(per_group)
+    # rebuild per_group and multislot indices
+    self._rebuild_indexes_from_last_scheduled()
+    self.render_calendar(self.last_per_group)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     try:
       self.write_pdfs(self.last_scheduled, self.last_per_group, OUTPUT_DIR)
@@ -589,6 +617,11 @@ class SchedulerGUI:
         for j,d in enumerate(DAYS, start=1):
           frm = tk.Frame(tab, borderwidth=1, relief="solid", width=140, height=44)
           frm.grid_propagate(False); frm.grid(row=i, column=j, sticky="nsew", padx=1, pady=1)
+          # attach coordinates for context menu/paste
+          frm.group_id = g
+          frm.day = d
+          frm.hour = h
+          frm.bind("<Button-3>", lambda ev, G=g, D=d, H=h: self._cell_context_menu(ev, G, D, H))
           cell_map[(d,h)] = frm
 
       items = per_group.get(g, [])
@@ -603,9 +636,8 @@ class SchedulerGUI:
         att = self.multislot_groups.get(key, [s.group])
         att_txt = ",".join(f"G{x}" for x in att)
         col = deterministic_color(s.course)
-        info = self.courses.get(s.course)
-        hall = info.hall if info else None
-        lecturer = info.lecturer if info else None
+        hall = s.hall or (self.courses.get(s.course).hall if self.courses.get(s.course) else None)
+        lecturer = s.lecturer or (self.courses.get(s.course).lecturer if self.courses.get(s.course) else None)
         for k in range(s.duration):
           hh = s.start_hour + k
           frame = cell_map.get((s.day, hh))
@@ -619,12 +651,233 @@ class SchedulerGUI:
           if extra:
             text += "\n" + " | ".join(extra)
           lbl = tk.Label(frame, text=(text if k==0 else "(cont)"), bg=bg, wraplength=120, justify="center")
+          # attach metadata for editing
+          lbl.session_meta = {
+            'group': g,
+            'course': s.course,
+            'day': s.day,
+            'start_hour': s.start_hour,
+            'duration': s.duration,
+            'kind': s.kind,
+            'session_id': s.session_id,
+          }
+          lbl.bind("<Double-1>", self._open_cell_editor)
+          lbl.bind("<Button-3>", self._on_label_right_click)
           lbl.pack(fill="both", expand=True)
 
       for col in range(len(DAYS)+1):
         tab.grid_columnconfigure(col, weight=1)
       for row in range(len(SLOTS)+1):
         tab.grid_rowconfigure(row, weight=1)
+
+  def _find_session_by_id(self, session_id: str) -> Optional[Session]:
+    for s in self.last_scheduled:
+      if s.session_id == session_id:
+        return s
+    return None
+
+  def _open_cell_editor(self, event):
+    widget = event.widget
+    meta = getattr(widget, 'session_meta', None)
+    if not meta:
+      return
+    sess = self._find_session_by_id(meta['session_id'])
+    if not sess:
+      return
+    self._edit_session_dialog(sess)
+
+  def _on_label_right_click(self, event):
+    widget = event.widget
+    meta = getattr(widget, 'session_meta', None)
+    if not meta:
+      return
+    menu = tk.Menu(self.root, tearoff=0)
+    menu.add_command(label="Edit", command=lambda: self._edit_session_dialog(self._find_session_by_id(meta['session_id'])))
+    menu.add_command(label="Copy", command=lambda: self._copy_session(meta['session_id']))
+    menu.add_command(label="Delete", command=lambda: self._delete_session(meta['session_id']))
+    try:
+      menu.tk_popup(event.x_root, event.y_root)
+    finally:
+      menu.grab_release()
+
+  def _cell_context_menu(self, event, group_id: int, day: str, hour: int):
+    menu = tk.Menu(self.root, tearoff=0)
+    if self._clipboard_session is not None:
+      menu.add_command(label=f"Paste here ({day} {hour:02d}:00)", command=lambda: self._paste_session_here(group_id, day, hour))
+    else:
+      menu.add_command(label="Paste here", state="disabled")
+    try:
+      menu.tk_popup(event.x_root, event.y_root)
+    finally:
+      menu.grab_release()
+
+  def _copy_session(self, session_id: str):
+    s = self._find_session_by_id(session_id)
+    if s is None:
+      return
+    self._clipboard_session = copy.deepcopy(s)
+    self.status.config(text=f"Copied {s.course} G{s.group} {s.day} {s.start_hour}")
+
+  def _delete_session(self, session_id: str):
+    s = self._find_session_by_id(session_id)
+    if s is None:
+      return
+    self.last_scheduled = [x for x in self.last_scheduled if x.session_id != session_id]
+    self._rebuild_indexes_from_last_scheduled()
+    self.render_calendar(self.last_per_group)
+    self.status.config(text="Session deleted")
+
+  def _paste_session_here(self, group_id: int, day: str, hour: int):
+    if self._clipboard_session is None:
+      return
+    new_s = copy.deepcopy(self._clipboard_session)
+    new_s.group = group_id
+    new_s.day = day
+    new_s.start_hour = hour
+    if hour + new_s.duration > SLOTS[-1] + 1:
+      messagebox.showerror("Paste", "Duration exceeds end of day")
+      return
+    conf = self._check_conflicts(new_s)
+    if any(conf.values()):
+      if not messagebox.askyesno("Conflicts", "Conflicts detected. Paste anyway?"):
+        return
+    new_s.session_id = f"paste_{len(self.last_scheduled)}_{new_s.course}_{new_s.group}_{new_s.day}_{new_s.start_hour}"
+    self.last_scheduled.append(new_s)
+    self._rebuild_indexes_from_last_scheduled()
+    self.render_calendar(self.last_per_group)
+    self.status.config(text="Session pasted")
+
+  def _check_conflicts(self, candidate: Session, exclude_id: Optional[str] = None) -> Dict[str, List[Dict]]:
+    conflicts = {'time': [], 'lecturer': [], 'hall': []}
+    for s in self.last_scheduled:
+      if exclude_id and s.session_id == exclude_id:
+        continue
+      if s.day == candidate.day:
+        # time overlap for same group
+        if s.group == candidate.group and s.start_hour is not None and candidate.start_hour is not None:
+          if s.start_hour < (candidate.start_hour + candidate.duration) and candidate.start_hour < (s.start_hour + s.duration):
+            conflicts['time'].append({'with': s.course, 'start': s.start_hour, 'dur': s.duration})
+        # lecturer
+        if candidate.lecturer and s.lecturer == candidate.lecturer and s.start_hour is not None and candidate.start_hour is not None:
+          if s.start_hour < (candidate.start_hour + candidate.duration) and candidate.start_hour < (s.start_hour + s.duration):
+            conflicts['lecturer'].append({'with': s.course, 'start': s.start_hour, 'dur': s.duration})
+        # hall
+        if candidate.hall and s.hall == candidate.hall and s.start_hour is not None and candidate.start_hour is not None:
+          if s.start_hour < (candidate.start_hour + candidate.duration) and candidate.start_hour < (s.start_hour + s.duration):
+            conflicts['hall'].append({'with': s.course, 'start': s.start_hour, 'dur': s.duration})
+    return conflicts
+
+  def _suggest_alternatives(self, candidate: Session) -> Dict[str, List[str]]:
+    suggestions: Dict[str, List[str]] = {'hours': [], 'lecturers': [], 'halls': []}
+    # free hours on same day for same group length
+    for h in SLOTS:
+      if h + candidate.duration <= SLOTS[-1] + 1:
+        temp = copy.deepcopy(candidate)
+        temp.start_hour = h
+        conf = self._check_conflicts(temp, exclude_id=candidate.session_id)
+        if not any(conf.values()):
+          suggestions['hours'].append(f"{h:02d}:00")
+          if len(suggestions['hours']) >= 5:
+            break
+    # lecturers alternative: from all course lecturers list (if any attribute exists in CourseInfo)
+    # here we just list distinct lecturers from courses except current
+    cur = candidate.lecturer or ""
+    others = sorted({c.lecturer for c in self.courses.values() if c.lecturer and c.lecturer != cur})
+    suggestions['lecturers'] = others[:5]
+    # halls alternative: distinct halls from courses
+    curh = candidate.hall or ""
+    halls = sorted({c.hall for c in self.courses.values() if c.hall and c.hall != curh})
+    suggestions['halls'] = halls[:5]
+    return suggestions
+
+  def _edit_session_dialog(self, sess: Session):
+    win = tk.Toplevel(self.root)
+    win.title("Edit session")
+    frm = ttk.Frame(win, padding=8)
+    frm.pack(fill="both", expand=True)
+    # fields
+    ttk.Label(frm, text="Course").grid(row=0, column=0, sticky="w")
+    cb_course = ttk.Combobox(frm, values=list(self.courses.keys()), state="readonly"); cb_course.set(sess.course); cb_course.grid(row=0, column=1, padx=6, pady=4)
+    ttk.Label(frm, text="Group").grid(row=1, column=0, sticky="w")
+    sp_group = ttk.Spinbox(frm, from_=1, to=max((c.groups for c in self.courses.values()), default=1)); sp_group.delete(0, tk.END); sp_group.insert(0, str(sess.group)); sp_group.grid(row=1, column=1, padx=6, pady=4)
+    ttk.Label(frm, text="Kind").grid(row=2, column=0, sticky="w")
+    cb_kind = ttk.Combobox(frm, values=["theory","lab"], state="readonly"); cb_kind.set(sess.kind); cb_kind.grid(row=2, column=1, padx=6, pady=4)
+    ttk.Label(frm, text="Day").grid(row=3, column=0, sticky="w")
+    cb_day = ttk.Combobox(frm, values=DAYS, state="readonly"); cb_day.set(sess.day or DAYS[0]); cb_day.grid(row=3, column=1, padx=6, pady=4)
+    ttk.Label(frm, text="Start hour").grid(row=4, column=0, sticky="w")
+    sp_hour = ttk.Spinbox(frm, from_=SLOT_START, to=SLOT_START+SLOT_COUNT-1); sp_hour.delete(0, tk.END); sp_hour.insert(0, str(sess.start_hour or SLOT_START)); sp_hour.grid(row=4, column=1, padx=6, pady=4)
+    ttk.Label(frm, text="Duration").grid(row=5, column=0, sticky="w")
+    sp_dur = ttk.Spinbox(frm, from_=1, to=4); sp_dur.delete(0, tk.END); sp_dur.insert(0, str(sess.duration)); sp_dur.grid(row=5, column=1, padx=6, pady=4)
+    ttk.Label(frm, text="Lecturer").grid(row=6, column=0, sticky="w")
+    e_lect = ttk.Entry(frm); e_lect.insert(0, sess.lecturer or ""); e_lect.grid(row=6, column=1, padx=6, pady=4)
+    ttk.Label(frm, text="Hall").grid(row=7, column=0, sticky="w")
+    e_hall = ttk.Entry(frm); e_hall.insert(0, sess.hall or ""); e_hall.grid(row=7, column=1, padx=6, pady=4)
+
+    info_var = tk.StringVar(value="")
+    ttk.Label(frm, textvariable=info_var, foreground="#a00").grid(row=8, column=0, columnspan=2, sticky="w")
+
+    def on_check():
+      cand = copy.deepcopy(sess)
+      cand.course = cb_course.get()
+      cand.group = int(sp_group.get())
+      cand.kind = cb_kind.get()
+      cand.day = cb_day.get()
+      cand.start_hour = int(sp_hour.get())
+      cand.duration = int(sp_dur.get())
+      cand.lecturer = e_lect.get().strip() or None
+      cand.hall = e_hall.get().strip() or None
+      conf = self._check_conflicts(cand, exclude_id=sess.session_id)
+      if any(conf.values()):
+        sug = self._suggest_alternatives(cand)
+        msg = ["Conflicts detected:"]
+        for k,v in conf.items():
+          if v:
+            msg.append(f"- {k}: {len(v)}")
+        if any(sug.values()):
+          msg.append("Suggestions:")
+          if sug['hours']:
+            msg.append("  Free hours: " + ", ".join(sug['hours']))
+          if sug['lecturers']:
+            msg.append("  Alt lecturers: " + ", ".join(sug['lecturers']))
+          if sug['halls']:
+            msg.append("  Alt halls: " + ", ".join(sug['halls']))
+        info_var.set("\n".join(msg))
+      else:
+        info_var.set("No conflicts.")
+
+    def on_save():
+      cand = copy.deepcopy(sess)
+      cand.course = cb_course.get()
+      cand.group = int(sp_group.get())
+      cand.kind = cb_kind.get()
+      cand.day = cb_day.get()
+      cand.start_hour = int(sp_hour.get())
+      cand.duration = int(sp_dur.get())
+      cand.lecturer = e_lect.get().strip() or None
+      cand.hall = e_hall.get().strip() or None
+      conf = self._check_conflicts(cand, exclude_id=sess.session_id)
+      if any(conf.values()):
+        if not messagebox.askyesno("Conflicts", "There are conflicts. Save anyway?"):
+          return
+      # apply updates
+      sess.course = cand.course
+      sess.group = cand.group
+      sess.kind = cand.kind
+      sess.day = cand.day
+      sess.start_hour = cand.start_hour
+      sess.duration = cand.duration
+      sess.lecturer = cand.lecturer
+      sess.hall = cand.hall
+      # rebuild indices and re-render
+      self._rebuild_indexes_from_last_scheduled()
+      self.render_calendar(self.last_per_group)
+      win.destroy()
+
+    btns = ttk.Frame(frm)
+    btns.grid(row=9, column=0, columnspan=2, pady=6)
+    ttk.Button(btns, text="Check", command=on_check).pack(side="left", padx=4)
+    ttk.Button(btns, text="Save", command=on_save).pack(side="left", padx=4)
+    ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="left", padx=4)
 
   def _build_calendar_table(self, story: List, title: str, items: List[Session], multi: Dict[Tuple[str,str,int,int], List[int]], font_name: str):
     story.append(Paragraph(ar_text(title), ParagraphStyle(name='Title', fontName=font_name, fontSize=16, leading=20, alignment=1)))
@@ -636,7 +889,13 @@ class SchedulerGUI:
 
     data[0][0] = ar_text("الوقت/اليوم")
     for j,d in enumerate(DAYS, start=1):
-      data[0][j] = d
+      # render Arabic day names
+      try:
+        idx = DAYS.index(d)
+        name = AR_DAYS[idx]
+      except Exception:
+        name = d
+      data[0][j] = ar_text(name)
     for i in range(1, n_rows):
       data[i][0] = slot_label(i-1)
 
@@ -655,13 +914,15 @@ class SchedulerGUI:
         continue
       col = 1 + DAYS.index(s.day)
       row = 1 + slot_idx_from_hour(s.start_hour)
-      text = f"{s.course}\n{','.join('G'+str(g) for g in multi.get((s.course, s.day, s.start_hour, s.duration), [s.group]))}\n{s.kind}"
+      text = f"{s.course}\n{','.join('G'+str(g) for g in multi.get((s.course, s.day, s.start_hour, s.duration), [s.group]))}\n{('نظري' if s.kind=='theory' else 'عملي')}"
       info = self.courses.get(s.course)
       text_extra = []
-      if info and info.hall:
-        text_extra.append(info.hall)
-      if info and info.lecturer:
-        text_extra.append(info.lecturer)
+      hall = (s.hall or (info.hall if info else None))
+      lect = (s.lecturer or (info.lecturer if info else None))
+      if hall:
+        text_extra.append(hall)
+      if lect:
+        text_extra.append(lect)
       if text_extra:
         text += "\n" + " | ".join(text_extra)
       data[row][col] = ar_text(text)
